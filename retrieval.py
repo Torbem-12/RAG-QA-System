@@ -57,8 +57,6 @@ import pickle                        # saves/loads the chunk list to disk
 from tqdm import tqdm                # progress bar during indexing
 from dotenv import load_dotenv       # loads API keys from .env file
 from rank_bm25 import BM25Okapi      # keyword-based baseline retrieval
-# SentenceTransformer is imported lazily inside load_index_and_chunks()
-# to avoid loading PyTorch at module import time (kills Streamlit Cloud free tier)
 from duckduckgo_search import DDGS   # free web search, no API key needed
 from bs4 import BeautifulSoup        # parses HTML from web pages
 import requests                      # fetches web page content
@@ -109,11 +107,37 @@ CHUNKS_PATH = "chunks.pkl"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
+class HFEmbedder:
+    """
+    Uses HuggingFace Inference API to generate embeddings.
+    This replaces local SentenceTransformer/PyTorch which is too large
+    for Streamlit Cloud free tier (1 GB RAM limit).
+    The API is free for public models with a HuggingFace account.
+    """
+    def __init__(self, model_name, hf_token):
+        self.api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
+        self.headers = {"Authorization": f"Bearer {hf_token}"}
+
+    def encode(self, texts, show_progress_bar=False, convert_to_numpy=True):
+        if isinstance(texts, str):
+            texts = [texts]
+        response = requests.post(
+            self.api_url,
+            headers=self.headers,
+            json={"inputs": texts, "options": {"wait_for_model": True}}
+        )
+        response.raise_for_status()
+        embeddings = np.array(response.json(), dtype=np.float32)
+        # If shape is (batch, seq_len, dim), mean-pool over seq_len
+        if embeddings.ndim == 3:
+            embeddings = embeddings.mean(axis=1)
+        return embeddings
+
+
 def _load_sbert():
-    """Lazy-load SentenceTransformer so PyTorch is not imported at module level.
-    This prevents Streamlit Cloud from crashing due to memory at startup."""
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+    """Load HuggingFace API embedder instead of local SentenceTransformer."""
+    hf_token = os.getenv("HF_TOKEN", "")
+    return HFEmbedder(EMBEDDING_MODEL_NAME, hf_token)
 
 # Maximum characters per chunk.
 # 500 chosen because it fits within the language model's
