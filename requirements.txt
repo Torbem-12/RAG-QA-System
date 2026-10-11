@@ -6,14 +6,9 @@ rank-bm25
 duckduckgo-search
 requests
 beautifulsoup4
-langchain
-langchain-community
 groq
-ragas
-datasets
-openai
-streamlit
 python-dotenv
 numpy
 tqdm
 lxml
+streamlit
