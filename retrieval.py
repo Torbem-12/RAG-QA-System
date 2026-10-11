@@ -50,7 +50,15 @@ except ImportError:
     OCR_AVAILABLE = False
     print("[WARNING] pytesseract not installed. Scanned PDFs will be skipped.")
 
-import faiss                         # vector index for semantic search
+# ── FAISS (optional — falls back to pure-numpy dot-product search) ─
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except Exception:
+    faiss = None
+    FAISS_AVAILABLE = False
+    print("[WARNING] faiss not available — using numpy fallback for vector search.")
+
 import numpy as np
 import pickle                        # saves/loads the chunk list to disk
 
@@ -345,23 +353,21 @@ def build_faiss_index(chunks):
     print("[INFO] Generating embeddings for all chunks...")
     texts = [chunk["text"] for chunk in chunks]
 
-    embeddings = model.encode(
-        texts,
-        batch_size=32,
-        show_progress_bar=True,
-        normalize_embeddings=True  # unit length for cosine similarity
-    )
+    embeddings = model.encode(texts, show_progress_bar=True)
 
     embeddings = np.array(embeddings, dtype="float32")
     dimension = embeddings.shape[1]
 
-    index = faiss.IndexFlatIP(dimension)
-    index.add(embeddings)
-
-    print(f"[INFO] FAISS index built with {index.ntotal} vectors.")
-
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    print(f"[INFO] FAISS index saved to '{FAISS_INDEX_PATH}'.")
+    if FAISS_AVAILABLE:
+        index = faiss.IndexFlatIP(dimension)
+        index.add(embeddings)
+        print(f"[INFO] FAISS index built with {index.ntotal} vectors.")
+        faiss.write_index(index, FAISS_INDEX_PATH)
+        print(f"[INFO] FAISS index saved to '{FAISS_INDEX_PATH}'.")
+    else:
+        index = embeddings  # numpy array fallback
+        np.save(FAISS_INDEX_PATH + ".npy", embeddings)
+        print(f"[INFO] Numpy index saved ({len(embeddings)} vectors).")
 
     with open(CHUNKS_PATH, "wb") as f:
         pickle.dump(chunks, f)
@@ -390,18 +396,23 @@ def load_index_and_chunks():
     where no pre-built index is present.
     """
     # ── Case 1: Index files exist — load them ────────────────
-    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CHUNKS_PATH):
+    npy_path = FAISS_INDEX_PATH + ".npy"
+    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CHUNKS_PATH) and FAISS_AVAILABLE:
         print("[INFO] Loading FAISS index from disk...")
         index = faiss.read_index(FAISS_INDEX_PATH)
-
-        print("[INFO] Loading chunks from disk...")
         with open(CHUNKS_PATH, "rb") as f:
             chunks = pickle.load(f)
-
-        print("[INFO] Loading SBERT model...")
         model = _load_sbert()
-
         print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
+        return index, chunks, model
+
+    if os.path.exists(npy_path) and os.path.exists(CHUNKS_PATH):
+        print("[INFO] Loading numpy index from disk...")
+        index = np.load(npy_path)
+        with open(CHUNKS_PATH, "rb") as f:
+            chunks = pickle.load(f)
+        model = _load_sbert()
+        print(f"[INFO] Ready. Numpy index contains {len(index)} vectors.")
         return index, chunks, model
 
     # ── Case 2: No index — try building from docs/ folder ────
@@ -414,26 +425,22 @@ def load_index_and_chunks():
     if docs_exist:
         print("[INFO] No saved index found. Building from docs/ folder...")
         build_knowledge_base()
-        # Now load what we just built
-        index = faiss.read_index(FAISS_INDEX_PATH)
+        if FAISS_AVAILABLE and os.path.exists(FAISS_INDEX_PATH):
+            index = faiss.read_index(FAISS_INDEX_PATH)
+        else:
+            index = np.load(npy_path) if os.path.exists(npy_path) else np.zeros((0, 384), dtype="float32")
         with open(CHUNKS_PATH, "rb") as f:
             chunks = pickle.load(f)
         model = _load_sbert()
-        print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
         return index, chunks, model
 
     # ── Case 3: No index AND no docs — return empty index ────
-    # The app can still answer questions using web search (Layers 2 & 3).
-    # Layer 1 (local documents) will return no results until the user
-    # uploads PDFs via the app's upload interface.
-    print("[WARNING] No FAISS index and no PDF documents found.")
+    print("[WARNING] No index and no PDF documents found.")
     print("[INFO] Starting with empty index — web search still works.")
-
     model = _load_sbert()
-    dimension = 384  # all-MiniLM-L6-v2 embedding dimension
-    index = faiss.IndexFlatIP(dimension)
+    # Empty numpy array — semantic_retrieve will detect len==0 and skip
+    index = np.zeros((0, 384), dtype="float32")
     chunks = []
-
     return index, chunks, model
 
 
@@ -449,29 +456,40 @@ def semantic_retrieve(query, index, chunks, model, top_k=TOP_K):
     Returns chunks ranked by cosine similarity score.
     Returns an empty list if the index is empty (no documents uploaded yet).
     """
-    # Guard: if the index is empty, skip FAISS search
-    if index.ntotal == 0:
-        print("[INFO] FAISS index is empty — no local documents to search.")
+    # Guard: if the index is empty, skip search
+    n_vecs = index.ntotal if FAISS_AVAILABLE and hasattr(index, "ntotal") else len(index)
+    if n_vecs == 0:
+        print("[INFO] Index is empty — no local documents to search.")
         return []
 
-    query_embedding = model.encode(
-        [query],
-        normalize_embeddings=True
-    ).astype("float32")
+    query_embedding = model.encode([query]).astype("float32")
 
-    scores, indices = index.search(query_embedding, top_k)
-
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
-            continue
-        results.append({
-            "text": chunks[idx]["text"],
-            "source": chunks[idx]["source"],
-            "page": chunks[idx]["page"],
-            "score": float(score),
-            "retrieval_type": "semantic"
-        })
+    if FAISS_AVAILABLE and hasattr(index, "search"):
+        scores, indices = index.search(query_embedding, top_k)
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            results.append({
+                "text": chunks[idx]["text"],
+                "source": chunks[idx]["source"],
+                "page": chunks[idx]["page"],
+                "score": float(score),
+                "retrieval_type": "semantic"
+            })
+    else:
+        # Numpy dot-product fallback
+        dot_scores = (index @ query_embedding.T).flatten()
+        top_indices = np.argsort(dot_scores)[::-1][:top_k]
+        results = []
+        for idx in top_indices:
+            results.append({
+                "text": chunks[idx]["text"],
+                "source": chunks[idx]["source"],
+                "page": chunks[idx]["page"],
+                "score": float(dot_scores[idx]),
+                "retrieval_type": "semantic"
+            })
 
     return results
 

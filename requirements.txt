@@ -1,6 +1,5 @@
 PyMuPDF>=1.24.0
 nltk
-faiss-cpu<1.8.0
 rank-bm25
 duckduckgo-search
 requests
