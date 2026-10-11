@@ -4,6 +4,8 @@
 # Author : Bem Thomas | Supervisor: Dr. Stephen Akuma
 # ============================================================
 
+import traceback
+import sys
 import os, json, hashlib, tempfile
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +13,13 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
-from rag_chain import ask
+try:
+    from rag_chain import ask
+except Exception as _import_err:
+    import streamlit as st
+    st.error(f"STARTUP ERROR: {_import_err}")
+    st.code(traceback.format_exc())
+    st.stop()
 
 load_dotenv()
 
