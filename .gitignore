@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+ngrok.exe
+chunks.pkl
+faiss_index.bin
+*.pyc

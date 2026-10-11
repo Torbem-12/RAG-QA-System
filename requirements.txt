@@ -1,0 +1,134 @@
+# ============================================================
+# requirements.txt
+# RAG-Based University Question Answering System
+# Father Moses Orshio Adasu University, Makurdi
+# Author: Bem Thomas
+# ============================================================
+
+# ── DOCUMENT PROCESSING ─────────────────────────────────────
+
+# PyMuPDF: extracts text from PDF files page by page.
+# We use this instead of pdfminer or pdfplumber because it is
+# faster, handles scanned-layout PDFs better, and gives us
+# direct access to page numbers for source citation.
+PyMuPDF==1.23.8
+
+# ── TEXT PROCESSING & TOKENISATION ──────────────────────────
+
+# NLTK: used for word tokenisation and stop word removal
+# in the BM25 baseline retrieval pipeline.
+nltk==3.8.1
+
+# ── EMBEDDING MODEL ─────────────────────────────────────────
+
+# sentence-transformers: provides the Sentence-BERT model
+# (all-MiniLM-L6-v2) used to convert document chunks and
+# user queries into 384-dimensional dense vectors.
+# This specific model was chosen because:
+#   - It uses under 300 MB of RAM (safe for a 4GB machine)
+#   - It runs on CPU without needing a GPU
+#   - It produces high-quality semantic embeddings for English text
+sentence-transformers==2.7.0
+
+# ── VECTOR DATABASE ─────────────────────────────────────────
+
+# faiss-cpu: Facebook AI Similarity Search library.
+# Used to build and query the vector index for semantic retrieval.
+# We use the CPU version because the development machine has
+# no dedicated GPU. faiss-cpu handles collections of this size
+# (a few thousand university document chunks) with no problem.
+faiss-cpu==1.8.0
+
+# ── BM25 BASELINE RETRIEVAL ─────────────────────────────────
+
+# rank-bm25: lightweight BM25 implementation in Python.
+# Used to build the keyword-based baseline retrieval system
+# that we compare against the semantic RAG pipeline.
+rank-bm25==0.2.2
+
+# ── WEB AUGMENTATION ────────────────────────────────────────
+
+# duckduckgo-search: free, no-API-key web search library.
+# Used to retrieve real-time web results when the local
+# vector index does not contain a confident answer.
+# Chosen over Google Custom Search API because it requires
+# no billing setup and has no rate-limit concerns for
+# a university project at this scale.
+duckduckgo-search==6.2.1
+
+# requests: used to fetch the full HTML content of web pages
+# returned by the DuckDuckGo search results.
+requests==2.31.0
+
+# beautifulsoup4: used to parse and clean HTML content
+# fetched from web pages, extracting only the readable text
+# and stripping navigation, ads, and other non-content elements.
+beautifulsoup4==4.12.3
+
+# ── RAG ORCHESTRATION ───────────────────────────────────────
+
+# langchain: the orchestration framework that connects the
+# retrieval pipeline to the generation model.
+# It manages prompt construction, context formatting,
+# and the flow of data between components.
+langchain==0.2.16
+
+# langchain-community: provides community-maintained integrations
+# including document loaders and retriever utilities used
+# in the LangChain pipeline.
+langchain-community==0.2.16
+
+# ── GENERATION MODEL (GROQ API) ─────────────────────────────
+
+# groq: the official Groq Python client.
+# We use the Groq API to run llama-3.1-8b-instant for
+# response generation instead of running a local model.
+# Reason: running a 7B parameter model locally requires
+# 5.5-6 GB of RAM minimum, which would crash a 4GB machine.
+# Groq delivers inference at speeds up to 750 tokens/second,
+# making response time faster than local inference even
+# on a high-end machine.
+groq==0.9.0
+
+# ── EVALUATION ──────────────────────────────────────────────
+
+# ragas: the evaluation framework used to measure the quality
+# of the RAG system using metrics: Faithfulness,
+# Answer Relevance, Context Precision, and Context Recall.
+ragas==0.1.21
+
+# datasets: required by RAGAS to format evaluation data
+# into the structure it expects for computing metrics.
+datasets==2.20.0
+
+# openai: RAGAS uses GPT-3.5-turbo as its judge model
+# to evaluate system outputs. This requires an OpenAI
+# API key set as an environment variable.
+openai==1.35.0
+
+# ── USER INTERFACE ───────────────────────────────────────────
+
+# streamlit: used to build the web-based chat interface
+# through which students interact with the system.
+# Chosen because it allows a fully functional web app
+# to be built using only Python, with no HTML or CSS required.
+streamlit==1.36.0
+
+# ── ENVIRONMENT VARIABLES ────────────────────────────────────
+
+# python-dotenv: loads API keys and configuration values
+# from a .env file into environment variables at runtime.
+# This keeps sensitive keys like the Groq API key and
+# OpenAI API key out of the source code.
+python-dotenv==1.0.1
+
+# ── UTILITIES ────────────────────────────────────────────────
+
+# numpy: required by FAISS and sentence-transformers
+# for numerical operations on embedding vectors.
+numpy==1.26.4
+
+# tqdm: displays progress bars during the embedding
+# and indexing process, which can take several minutes
+# for large document collections.
+tqdm==4.66.4
