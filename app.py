@@ -35,13 +35,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Import RAG chain — after set_page_config so errors display on screen
-try:
-    from rag_chain import ask
-except Exception as _import_err:
-    st.error(f"STARTUP ERROR: {_import_err}")
-    st.code(traceback.format_exc())
-    st.stop()
+# RAG chain is imported lazily inside process_and_respond()
+# to avoid loading heavy dependencies at startup (OOM on Streamlit Cloud)
 
 # ============================================================
 # CSS  — single source of truth, no conflicting rules
@@ -519,6 +514,7 @@ def badge_html(rtype):
 def process_and_respond(question):
     with st.spinner("🔍 Searching…"):
         try:
+            from rag_chain import ask
             result  = ask(question, use_web=True)
             answer  = result.get("answer", "Sorry, I could not find an answer.")
             sources = result.get("sources", [])
