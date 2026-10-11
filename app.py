@@ -13,13 +13,6 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
-try:
-    from rag_chain import ask
-except Exception as _import_err:
-    import streamlit as st
-    st.error(f"STARTUP ERROR: {_import_err}")
-    st.code(traceback.format_exc())
-    st.stop()
 
 load_dotenv()
 
@@ -33,7 +26,7 @@ DATA_DIR.mkdir(exist_ok=True)
 HISTORY_DIR.mkdir(exist_ok=True)
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIG — must come before any other st.* calls
 # ============================================================
 st.set_page_config(
     page_title="FMOAU Student Assistant",
@@ -41,6 +34,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# Import RAG chain — after set_page_config so errors display on screen
+try:
+    from rag_chain import ask
+except Exception as _import_err:
+    st.error(f"STARTUP ERROR: {_import_err}")
+    st.code(traceback.format_exc())
+    st.stop()
 
 # ============================================================
 # CSS  — single source of truth, no conflicting rules
