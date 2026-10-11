@@ -31,22 +31,28 @@
 
 import os
 import re
-import fitz                          # PyMuPDF — reads PDF files
+import io
+
+# ── PyMuPDF ──────────────────────────────────────────────────
+try:
+    import fitz
+except ImportError:
+    fitz = None
+
+# ── OCR (optional — only available on Windows with Tesseract) ─
 try:
     import pytesseract
     from PIL import Image
-    import io
-    # Set Tesseract path for Windows
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR	esseract.exe'
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     OCR_AVAILABLE = True
     print("[INFO] OCR (Tesseract) is available for scanned PDFs.")
 except ImportError:
     OCR_AVAILABLE = False
     print("[WARNING] pytesseract not installed. Scanned PDFs will be skipped.")
+
 import faiss                         # vector index for semantic search
 import numpy as np
 import pickle                        # saves/loads the chunk list to disk
-import nltk
 
 from tqdm import tqdm                # progress bar during indexing
 from dotenv import load_dotenv       # loads API keys from .env file
@@ -60,11 +66,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed  # parallel web 
 # ── Load environment variables from .env ─────────────────────
 load_dotenv()
 
-# ── Download NLTK tokenizer data (only runs once) ────────────
-nltk.download("punkt", quiet=True)
-nltk.download("stopwords", quiet=True)
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
+# ── Download NLTK tokenizer data safely ──────────────────────
+# We download to an explicit directory and wrap everything in
+# try/except so a network failure on Streamlit Cloud does not
+# crash the whole app at import time.
+import nltk
+
+_nltk_data_dir = os.path.join(os.path.expanduser("~"), "nltk_data")
+os.makedirs(_nltk_data_dir, exist_ok=True)
+
+for _pkg in ("punkt", "punkt_tab", "stopwords"):
+    try:
+        nltk.download(_pkg, quiet=True, download_dir=_nltk_data_dir)
+    except Exception:
+        pass
+
+try:
+    from nltk.corpus import stopwords as _sw
+    from nltk.tokenize import word_tokenize
+    STOP_WORDS = set(_sw.words("english"))
+except Exception:
+    # Fallback: empty stop-word set — BM25 still works, just noisier
+    STOP_WORDS = set()
+    def word_tokenize(text):
+        return text.lower().split()
 
 # ============================================================
 # CONFIGURATION
@@ -137,8 +162,6 @@ UNIVERSITY_URLS = [
     "https://www.facebook.com/MOAUNewsonline",
 ]
 
-STOP_WORDS = set(stopwords.words("english"))
-
 
 # ============================================================
 # STEP 1 — PDF LOADING AND TEXT EXTRACTION
@@ -155,6 +178,15 @@ def load_pdfs_from_folder(folder_path):
         - "page": page number (1-indexed)
     """
     pages = []
+
+    if fitz is None:
+        print("[WARNING] PyMuPDF (fitz) is not installed. Cannot read PDFs.")
+        return pages
+
+    if not os.path.exists(folder_path):
+        print(f"[WARNING] docs/ folder does not exist at '{folder_path}'.")
+        return pages
+
     pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
 
     if not pdf_files:
@@ -488,14 +520,11 @@ def scrape_university_websites(query):
             soup = BeautifulSoup(resp.text, "html.parser")
 
             # Remove script and style tags
-            for tag in soup(["script","style","nav","footer","header"]):
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
                 tag.decompose()
 
             # Extract all visible text
             text = soup.get_text(separator=" ", strip=True)
-
-            # Clean up whitespace
-            import re
             text = re.sub(r'\s+', ' ', text).strip()
 
             if not text or len(text) < 100:
@@ -506,11 +535,10 @@ def scrape_university_websites(query):
             for i in range(0, min(len(text), 5000), chunk_size):
                 chunk = text[i:i+chunk_size].strip()
                 if len(chunk) > 100:
-                    # Simple relevance check — does chunk mention query words?
                     query_words = query.lower().split()
                     chunk_lower = chunk.lower()
                     matches = sum(1 for w in query_words if w in chunk_lower)
-                    if matches > 0 or i == 0:  # always include first chunk
+                    if matches > 0 or i == 0:
                         results.append({
                             "text": chunk,
                             "source": url,
@@ -525,9 +553,8 @@ def scrape_university_websites(query):
             print(f"[WARNING] Could not scrape {url}: {e}")
             continue
 
-    # Sort by relevance score
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:10]  # return top 10 most relevant passages
+    return results[:10]
 
 
 def _ddg_search_one(sq, top_k, region="ng-en"):
@@ -548,23 +575,10 @@ def web_search_university(query, top_k=WEB_TOP_K):
     LAYER 3 — Searches the university website and general
     web for current institutional information including
     announcements, timetables, news, and admin updates.
-
-    OPTIMISATION: All search query variations now run in
-    parallel using a ThreadPoolExecutor. Previously they ran
-    one-by-one (sequential), which multiplied the network
-    wait time by the number of queries. Running them in
-    parallel means total wait time equals roughly the
-    slowest single query rather than the sum of all queries.
-
-    Only 3 query variations are used instead of 6, further
-    cutting network overhead while keeping result diversity.
     """
     results = []
 
     try:
-        # Reduced to 3 best-performing query variations.
-        # They run in parallel so fewer queries = faster,
-        # and the most distinctive ones are kept.
         search_queries = [
             f"{UNIVERSITY_NAME} {query}",
             f"FMOAU Makurdi {query}",
@@ -573,7 +587,6 @@ def web_search_university(query, top_k=WEB_TOP_K):
 
         search_results = []
 
-        # Run all queries simultaneously in a thread pool
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(_ddg_search_one, sq, top_k): sq
@@ -588,7 +601,6 @@ def web_search_university(query, top_k=WEB_TOP_K):
                 except Exception:
                     pass
 
-        # Final fallback — plain web search (sequential, only if nothing returned)
         if not search_results:
             print("[INFO] No university results. Trying plain search...")
             ddgs_inst = DDGS()
@@ -627,22 +639,10 @@ def web_search_academic(query, top_k=WEB_TOP_K):
     LAYER 2 — Searches trusted academic sources online
     when a student asks about course content, definitions,
     concepts, or topics not covered in uploaded PDFs.
-
-    Trusted sources include Wikipedia, Khan Academy,
-    GeeksforGeeks, Britannica, MIT OpenCourseWare,
-    and other reputable educational websites.
-
-    This layer ensures students can get academic content
-    answers even when lecture notes are not uploaded,
-    preventing the system from failing on course questions.
     """
     results = []
 
     try:
-        # Build a search query that targets academic sources
-        # by appending "site:" filters is not supported in
-        # DuckDuckGo text search, so we add academic keywords
-        # to bias results toward educational content
         academic_query = f"{query} explanation definition university course"
         print(f"[INFO] Layer 2 academic search: '{academic_query}'")
 
@@ -654,7 +654,6 @@ def web_search_academic(query, top_k=WEB_TOP_K):
             )
         )
 
-        # Filter results to prefer trusted academic sources
         trusted_results = []
         other_results = []
 
@@ -666,10 +665,7 @@ def web_search_academic(query, top_k=WEB_TOP_K):
             if len(snippet.strip()) < 50:
                 continue
 
-            # Check if URL is from a trusted academic source
-            is_trusted = any(
-                source in url for source in ACADEMIC_SOURCES
-            )
+            is_trusted = any(source in url for source in ACADEMIC_SOURCES)
 
             entry = {
                 "text": f"{title}. {snippet}",
@@ -684,7 +680,6 @@ def web_search_academic(query, top_k=WEB_TOP_K):
             else:
                 other_results.append(entry)
 
-        # Prioritise trusted academic sources
         combined = trusted_results + other_results
         results = combined[:top_k]
 
@@ -706,19 +701,9 @@ def retrieve(query, index, chunks, model, use_web=True):
     LAYER 1: Semantic retrieval from local PDF knowledge base
     LAYER 2: Academic web search for course content
     LAYER 3: University website and general web search
-
-    Decision logic:
-    - Layer 1 always runs first (local documents)
-    - Layer 3 always runs (university/general web)
-    - Layer 2 runs when local confidence is low OR when
-      the query appears to be about academic content
-
-    Local results are placed first so the language model
-    sees verified institutional content before web content.
     """
     print(f"\n[INFO] Starting three-layer retrieval for: '{query}'")
 
-    # ── LAYER 1: Local PDF semantic retrieval ──────────────
     print("[INFO] Layer 1: Searching local knowledge base...")
     local_results = semantic_retrieve(query, index, chunks, model)
 
@@ -749,10 +734,6 @@ def retrieve(query, index, chunks, model, use_web=True):
         is_staff_query = any(kw in query_lower for kw in staff_keywords)
         run_layer2 = top_score < CONFIDENCE_THRESHOLD or is_academic_query or is_staff_query
 
-        # ── OPTIMISATION: Run all web layers in parallel ───
-        # Previously: scrape → Layer 3 search → Layer 2 search (sequential)
-        # Now: all three launch simultaneously; total wait time
-        # equals the slowest single call instead of their sum.
         scraped_results = []
         search_results  = []
 
@@ -782,12 +763,8 @@ def retrieve(query, index, chunks, model, use_web=True):
                 except Exception as e:
                     print(f"[WARNING] Layer 2 search failed: {e}")
 
-        # Combine scraped + search results, scraped first (more reliable)
         layer3_results = scraped_results + search_results
 
-    # Combine results: Local first, then Layer 3, then Layer 2
-    # Local results come first so the model sees verified
-    # institutional content before web content
     combined = local_results + layer3_results + layer2_results
 
     print(f"[INFO] Total passages retrieved: {len(combined)}")
