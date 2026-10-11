@@ -56,6 +56,7 @@ from duckduckgo_search import DDGS   # free web search, no API key needed
 from bs4 import BeautifulSoup        # parses HTML from web pages
 import requests                      # fetches web page content
 from concurrent.futures import ThreadPoolExecutor, as_completed  # parallel web search
+
 # ── Load environment variables from .env ─────────────────────
 load_dotenv()
 
@@ -312,26 +313,63 @@ def build_faiss_index(chunks):
 def load_index_and_chunks():
     """
     Loads the FAISS index, chunk list, and SBERT model
-    from disk. Called once at system startup.
+    from disk. Called once per question in rag_chain.ask().
+
+    If the index files do not exist (e.g. on first run on
+    Streamlit Cloud where they are not committed to GitHub),
+    this function will:
+      1. Try to build the index from any PDFs in the docs/ folder
+      2. If there are no PDFs either, return an empty index so
+         the app can still start and answer via web search
+
+    This makes the app resilient to cold-start deployments
+    where no pre-built index is present.
     """
-    if not os.path.exists(FAISS_INDEX_PATH) or \
-       not os.path.exists(CHUNKS_PATH):
-        raise FileNotFoundError(
-            "FAISS index or chunks file not found. "
-            "Please run build_knowledge_base() first."
-        )
+    # ── Case 1: Index files exist — load them ────────────────
+    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CHUNKS_PATH):
+        print("[INFO] Loading FAISS index from disk...")
+        index = faiss.read_index(FAISS_INDEX_PATH)
 
-    print("[INFO] Loading FAISS index from disk...")
-    index = faiss.read_index(FAISS_INDEX_PATH)
+        print("[INFO] Loading chunks from disk...")
+        with open(CHUNKS_PATH, "rb") as f:
+            chunks = pickle.load(f)
 
-    print("[INFO] Loading chunks from disk...")
-    with open(CHUNKS_PATH, "rb") as f:
-        chunks = pickle.load(f)
+        print("[INFO] Loading SBERT model...")
+        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-    print("[INFO] Loading SBERT model...")
+        print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
+        return index, chunks, model
+
+    # ── Case 2: No index — try building from docs/ folder ────
+    docs_exist = (
+        os.path.exists(DOCS_FOLDER) and
+        any(f.endswith(".pdf") for f in os.listdir(DOCS_FOLDER))
+        if os.path.exists(DOCS_FOLDER) else False
+    )
+
+    if docs_exist:
+        print("[INFO] No saved index found. Building from docs/ folder...")
+        build_knowledge_base()
+        # Now load what we just built
+        index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(CHUNKS_PATH, "rb") as f:
+            chunks = pickle.load(f)
+        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
+        return index, chunks, model
+
+    # ── Case 3: No index AND no docs — return empty index ────
+    # The app can still answer questions using web search (Layers 2 & 3).
+    # Layer 1 (local documents) will return no results until the user
+    # uploads PDFs via the app's upload interface.
+    print("[WARNING] No FAISS index and no PDF documents found.")
+    print("[INFO] Starting with empty index — web search still works.")
+
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    dimension = 384  # all-MiniLM-L6-v2 embedding dimension
+    index = faiss.IndexFlatIP(dimension)
+    chunks = []
 
-    print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
     return index, chunks, model
 
 
@@ -345,7 +383,13 @@ def semantic_retrieve(query, index, chunks, model, top_k=TOP_K):
     index for the most semantically similar document chunks.
 
     Returns chunks ranked by cosine similarity score.
+    Returns an empty list if the index is empty (no documents uploaded yet).
     """
+    # Guard: if the index is empty, skip FAISS search
+    if index.ntotal == 0:
+        print("[INFO] FAISS index is empty — no local documents to search.")
+        return []
+
     query_embedding = model.encode(
         [query],
         normalize_embeddings=True
