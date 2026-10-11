@@ -57,7 +57,8 @@ import pickle                        # saves/loads the chunk list to disk
 from tqdm import tqdm                # progress bar during indexing
 from dotenv import load_dotenv       # loads API keys from .env file
 from rank_bm25 import BM25Okapi      # keyword-based baseline retrieval
-from sentence_transformers import SentenceTransformer  # SBERT embedding model
+# SentenceTransformer is imported lazily inside load_index_and_chunks()
+# to avoid loading PyTorch at module import time (kills Streamlit Cloud free tier)
 from duckduckgo_search import DDGS   # free web search, no API key needed
 from bs4 import BeautifulSoup        # parses HTML from web pages
 import requests                      # fetches web page content
@@ -106,6 +107,13 @@ CHUNKS_PATH = "chunks.pkl"
 #   - Produces 384-dimensional embeddings with strong
 #     semantic quality for English text
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _load_sbert():
+    """Lazy-load SentenceTransformer so PyTorch is not imported at module level.
+    This prevents Streamlit Cloud from crashing due to memory at startup."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 # Maximum characters per chunk.
 # 500 chosen because it fits within the language model's
@@ -308,7 +316,7 @@ def build_faiss_index(chunks):
       of vectors
     """
     print("[INFO] Loading SBERT embedding model...")
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    model = _load_sbert()
 
     print("[INFO] Generating embeddings for all chunks...")
     texts = [chunk["text"] for chunk in chunks]
@@ -367,7 +375,7 @@ def load_index_and_chunks():
             chunks = pickle.load(f)
 
         print("[INFO] Loading SBERT model...")
-        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        model = _load_sbert()
 
         print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
         return index, chunks, model
@@ -386,7 +394,7 @@ def load_index_and_chunks():
         index = faiss.read_index(FAISS_INDEX_PATH)
         with open(CHUNKS_PATH, "rb") as f:
             chunks = pickle.load(f)
-        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        model = _load_sbert()
         print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
         return index, chunks, model
 
@@ -397,7 +405,7 @@ def load_index_and_chunks():
     print("[WARNING] No FAISS index and no PDF documents found.")
     print("[INFO] Starting with empty index — web search still works.")
 
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    model = _load_sbert()
     dimension = 384  # all-MiniLM-L6-v2 embedding dimension
     index = faiss.IndexFlatIP(dimension)
     chunks = []
