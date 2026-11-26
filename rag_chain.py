@@ -234,7 +234,7 @@ SYSTEM_PROMPT = """You are a helpful, friendly, and knowledgeable academic assis
 KNOWN FACTS ABOUT FMOAU (use these when answering):
 - Current Vice Chancellor: Professor Terseer Joseph Alabar
 - Location: Makurdi, Benue State, Nigeria
-- Official website: www.bsum.edu.ng
+- Official website: www.moaum.edu.ng
 - The university is a Benue State Government institution
 - Department of Mathematics and Computer Science is one of the departments
 
@@ -253,7 +253,7 @@ For questions about FMOAU specifically (vice chancellor, staff, fees, exam dates
 - READ ALL context passages carefully including web results
 - If any context passage contains relevant information, USE it to answer
 - If the web results contain the answer, state it clearly in your answer
-- If NO context passage contains the answer, say: "I could not find this specific information in my current sources. Please visit the university website at fmoau.edu.ng or contact the relevant office directly."
+- If NO context passage contains the answer, say: "I could not find this specific information in my current sources. Please visit the university website at www.moaum.edu.ng or contact the relevant office directly."
 
 RULE 3 — USE WEB RESULTS:
 Web search results are real-time data. If a web result mentions a name, date, announcement or fact — USE it. Do not ignore web results.

@@ -5,41 +5,36 @@
 # Author: Bem Thomas
 # ============================================================
 # PURPOSE OF THIS FILE:
-# This file handles everything related to building and querying
-# the knowledge base. It operates on three layers:
+# Builds and queries the knowledge base. It works in layers:
 #
-#   LAYER 1 — Local University Documents (PDFs)
-#       University handbooks, memos, circulars, lecture notes,
-#       and handouts uploaded to the docs/ folder.
+#   LAYER 1 - Stored knowledge base
+#       (a) University PDFs placed in the docs/ folder
+#       (b) Pages crawled from the university website and saved
+#           in data/site_knowledge.json (built offline)
+#       Both are chunked, embedded and searched semantically.
 #
-#   LAYER 2 — Academic Web Search
-#       When a question is about course content, definitions,
-#       or academic topics not fully covered in local PDFs,
-#       the system searches trusted academic sources online
-#       such as Wikipedia, Khan Academy, GeeksforGeeks,
-#       and other university course pages.
+#   LAYER 2 - Academic web search (live, optional)
+#       Trusted academic sources for course content questions.
 #
-#   LAYER 3 — University Website and General Web
-#       Real-time search of the university's website and
-#       social media handles for current announcements,
-#       timetables, news, and administrative updates.
-#
-# Together these three layers ensure the system can answer
-# both institutional questions AND academic content questions
-# without requiring every document to be uploaded manually.
+#   LAYER 3 - University website and general web (live, optional)
+#       Current announcements and news. Every live call has a
+#       timeout and fails safely, so the stored knowledge base
+#       can still answer when the live web is unreachable.
 # ============================================================
 
 import os
 import re
 import io
+import json
+from functools import lru_cache
 
-# ── PyMuPDF ──────────────────────────────────────────────────
+# -- PyMuPDF ---------------------------------------------------
 try:
     import fitz
 except ImportError:
     fitz = None
 
-# ── OCR (optional — only available on Windows with Tesseract) ─
+# -- OCR (optional - only available with Tesseract) ------------
 try:
     import pytesseract
     from PIL import Image
@@ -50,33 +45,35 @@ except ImportError:
     OCR_AVAILABLE = False
     print("[WARNING] pytesseract not installed. Scanned PDFs will be skipped.")
 
-# ── FAISS (optional — falls back to pure-numpy dot-product search) ─
+# -- FAISS (optional - falls back to numpy dot-product search) --
 try:
     import faiss
     FAISS_AVAILABLE = True
 except Exception:
     faiss = None
     FAISS_AVAILABLE = False
-    print("[WARNING] faiss not available — using numpy fallback for vector search.")
+    print("[WARNING] faiss not available - using numpy fallback for vector search.")
 
 import numpy as np
-import pickle                        # saves/loads the chunk list to disk
+import pickle
 
-from tqdm import tqdm                # progress bar during indexing
-from dotenv import load_dotenv       # loads API keys from .env file
-from rank_bm25 import BM25Okapi      # keyword-based baseline retrieval
-from duckduckgo_search import DDGS   # free web search, no API key needed
-from bs4 import BeautifulSoup        # parses HTML from web pages
-import requests                      # fetches web page content
-from concurrent.futures import ThreadPoolExecutor, as_completed  # parallel web search
+from tqdm import tqdm
+from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 
-# ── Load environment variables from .env ─────────────────────
+# ddgs is the maintained successor of duckduckgo_search
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
+
+from bs4 import BeautifulSoup
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 load_dotenv()
 
-# ── Download NLTK tokenizer data safely ──────────────────────
-# We download to an explicit directory and wrap everything in
-# try/except so a network failure on Streamlit Cloud does not
-# crash the whole app at import time.
+# -- NLTK data (safe download) ---------------------------------
 import nltk
 
 _nltk_data_dir = os.path.join(os.path.expanduser("~"), "nltk_data")
@@ -93,8 +90,8 @@ try:
     from nltk.tokenize import word_tokenize
     STOP_WORDS = set(_sw.words("english"))
 except Exception:
-    # Fallback: empty stop-word set — BM25 still works, just noisier
     STOP_WORDS = set()
+
     def word_tokenize(text):
         return text.lower().split()
 
@@ -103,119 +100,69 @@ except Exception:
 # ============================================================
 
 DOCS_FOLDER = "docs"
+SITE_KNOWLEDGE_PATH = os.path.join("data", "site_knowledge.json")
 FAISS_INDEX_PATH = "faiss_index.bin"
 CHUNKS_PATH = "chunks.pkl"
 
-# Sentence-BERT model for generating semantic embeddings.
-# all-MiniLM-L6-v2 was chosen because:
-#   - Uses under 300 MB RAM — safe for a 4 GB laptop
-#   - Runs on CPU without a GPU
-#   - Produces 384-dimensional embeddings with strong
-#     semantic quality for English text
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_DIM = 384
 
 
 class HFEmbedder:
-    """
-    Uses HuggingFace Inference API to generate embeddings.
-    This replaces local SentenceTransformer/PyTorch which is too large
-    for Streamlit Cloud free tier (1 GB RAM limit).
-    The API is free for public models with a HuggingFace account.
-    """
-    def __init__(self, model_name, hf_token):
-        self.api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
-        self.headers = {"Authorization": f"Bearer {hf_token}"}
+    def __init__(self, model_name, hf_token=None):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
 
     def encode(self, texts, show_progress_bar=False, convert_to_numpy=True):
         if isinstance(texts, str):
             texts = [texts]
-        response = requests.post(
-            self.api_url,
-            headers=self.headers,
-            json={"inputs": texts, "options": {"wait_for_model": True}}
-        )
-        response.raise_for_status()
-        embeddings = np.array(response.json(), dtype=np.float32)
-        # If shape is (batch, seq_len, dim), mean-pool over seq_len
-        if embeddings.ndim == 3:
-            embeddings = embeddings.mean(axis=1)
-        return embeddings
+        embs = self.model.encode(
+            texts,
+            batch_size=16,
+            show_progress_bar=show_progress_bar,
+            convert_to_numpy=True,
+        ).astype("float32")
+        if embs.ndim == 1:
+            embs = embs.reshape(1, -1)
+        import numpy as np
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs / np.maximum(norms, 1e-12)
 
 
 def _load_sbert():
-    """Load HuggingFace API embedder instead of local SentenceTransformer."""
-    hf_token = os.getenv("HF_TOKEN", "")
-    return HFEmbedder(EMBEDDING_MODEL_NAME, hf_token)
+    return HFEmbedder(EMBEDDING_MODEL_NAME)
 
-# Maximum characters per chunk.
-# 500 chosen because it fits within the language model's
-# context window while being large enough to contain
-# a complete thought or policy statement.
+
 CHUNK_SIZE = 500
-
-# Overlap between consecutive chunks in characters.
-# 50-character overlap ensures sentences split across
-# chunk boundaries are still fully represented.
 CHUNK_OVERLAP = 50
-
-# Number of top chunks retrieved from FAISS per query.
-# 5 follows Lewis et al. (2020) who found this balances
-# context richness against processing cost.
 TOP_K = 5
-
-# Similarity threshold below which web search is prioritised.
-# 0.4 was chosen empirically — below this the retrieved
-# chunk is likely only loosely related to the query.
 CONFIDENCE_THRESHOLD = 0.4
-
-# Number of web results to fetch per search call.
-# Reduced from 5 to 3 per query for speed — 3 queries × 3 results
-# still gives enough context while cutting network calls.
 WEB_TOP_K = 3
 
-# Trusted academic sources for course content searches.
-# These sites are prioritised when a student asks about
-# academic topics, definitions, or course concepts.
 ACADEMIC_SOURCES = [
-    "wikipedia.org",
-    "khanacademy.org",
-    "geeksforgeeks.org",
-    "britannica.com",
-    "coursera.org",
-    "mit.edu",
-    "stanford.edu",
-    "investopedia.com",
-    "sciencedirect.com",
-    "researchgate.net"
+    "wikipedia.org", "khanacademy.org", "geeksforgeeks.org",
+    "britannica.com", "coursera.org", "mit.edu", "stanford.edu",
+    "investopedia.com", "sciencedirect.com", "researchgate.net"
 ]
 
-# University-specific search targets for Layer 3
 UNIVERSITY_NAME = "Father Moses Orshio Adasu University Makurdi"
-UNIVERSITY_NAME_OLD = "Benue State University Makurdi"  # former name — more web presence
+UNIVERSITY_NAME_OLD = "Benue State University Makurdi"
 
-# Official university URLs to scrape directly
+# Official pages fetched live on every question (Layer 3).
+# Add specific pages that change often, for example a news page.
 UNIVERSITY_URLS = [
-    "https://www.bsum.edu.ng/",
-    "https://www.bsum.edu.ng/news",
-    "https://www.bsum.edu.ng/announcements",
-    "https://www.bsum.edu.ng/about",
-    "https://www.facebook.com/MOAUNewsonline",
+    "https://www.moaum.edu.ng/",
 ]
 
 
 # ============================================================
-# STEP 1 — PDF LOADING AND TEXT EXTRACTION
+# STEP 1 - PDF LOADING AND TEXT EXTRACTION
 # ============================================================
 
 def load_pdfs_from_folder(folder_path):
     """
-    Reads all PDF files from the docs/ folder and extracts
-    their text content page by page using PyMuPDF.
-
-    Returns a list of dicts, each with:
-        - "text": raw text of one page
-        - "source": filename of the PDF
-        - "page": page number (1-indexed)
+    Reads all PDF files from the docs/ folder page by page.
+    Returns a list of dicts: {"text", "source", "page"}.
     """
     pages = []
 
@@ -227,7 +174,7 @@ def load_pdfs_from_folder(folder_path):
         print(f"[WARNING] docs/ folder does not exist at '{folder_path}'.")
         return pages
 
-    pdf_files = [f for f in os.listdir(folder_path) if f.endswith(".pdf")]
+    pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
 
     if not pdf_files:
         print(f"[WARNING] No PDF files found in '{folder_path}'.")
@@ -237,23 +184,21 @@ def load_pdfs_from_folder(folder_path):
 
     for filename in tqdm(pdf_files, desc="Loading PDFs"):
         filepath = os.path.join(folder_path, filename)
+        file_pages = 0
         try:
             doc = fitz.open(filepath)
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 text = page.get_text().strip()
 
-                # If page has little or no text, try OCR (scanned PDF)
+                # Little or no text: probably a scanned page, try OCR
                 if len(text) < 50:
                     if OCR_AVAILABLE:
                         try:
-                            # Render page as image at 300 DPI for good OCR quality
                             mat = fitz.Matrix(300 / 72, 300 / 72)
                             pix = page.get_pixmap(matrix=mat)
-                            img_bytes = pix.tobytes("png")
-                            img = Image.open(io.BytesIO(img_bytes))
-                            text = pytesseract.image_to_string(img, lang='eng')
-                            text = text.strip()
+                            img = Image.open(io.BytesIO(pix.tobytes("png")))
+                            text = pytesseract.image_to_string(img, lang='eng').strip()
                             if len(text) > 50:
                                 print(f"[OCR] Extracted text from scanned page "
                                       f"{page_num + 1} of {filename}")
@@ -262,33 +207,32 @@ def load_pdfs_from_folder(folder_path):
                                   f"{filename}: {ocr_err}")
                             continue
                     else:
-                        continue  # Skip scanned page if OCR not available
+                        continue
 
                 if len(text) < 50:
-                    continue  # Still too little text after OCR, skip
+                    continue
 
-                pages.append({
-                    "text": text,
-                    "source": filename,
-                    "page": page_num + 1
-                })
+                pages.append({"text": text, "source": filename, "page": page_num + 1})
+                file_pages += 1
             doc.close()
         except Exception as e:
             print(f"[ERROR] Could not read {filename}: {e}")
+
+        print(f"[INFO] {filename}: {file_pages} page(s) with usable text.")
+        if file_pages == 0:
+            print(f"[WARNING] {filename} gave no text. It may be a scanned PDF "
+                  f"that needs OCR (install Tesseract + pytesseract).")
 
     print(f"[INFO] Extracted {len(pages)} pages total.")
     return pages
 
 
 # ============================================================
-# STEP 2 — TEXT CLEANING
+# STEP 2 - TEXT CLEANING
 # ============================================================
 
 def clean_text(text):
-    """
-    Removes noise from raw PDF text including page numbers,
-    headers, special characters, and excessive whitespace.
-    """
+    """Removes page numbers, odd characters and extra whitespace."""
     text = text.replace("\n", " ")
     text = re.sub(r'\bPage\s+\d+\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+\d+\s+', ' ', text)
@@ -298,18 +242,11 @@ def clean_text(text):
 
 
 # ============================================================
-# STEP 3 — CHUNKING
+# STEP 3 - CHUNKING
 # ============================================================
 
 def chunk_pages(pages):
-    """
-    Splits each page into overlapping chunks of CHUNK_SIZE
-    characters with CHUNK_OVERLAP characters of overlap.
-
-    Character-based chunking is used instead of token-based
-    because it is faster on low-resource hardware and
-    produces approximately correct sizes (1 token ≈ 4 chars).
-    """
+    """Splits each page into overlapping chunks of CHUNK_SIZE characters."""
     chunks = []
     for page in pages:
         text = clean_text(page["text"])
@@ -320,54 +257,70 @@ def chunk_pages(pages):
             end = start + CHUNK_SIZE
             chunk_text = text[start:end].strip()
             if len(chunk_text) > 100:
-                chunks.append({
-                    "text": chunk_text,
-                    "source": source,
-                    "page": page_num
-                })
+                chunks.append({"text": chunk_text, "source": source, "page": page_num})
             start += (CHUNK_SIZE - CHUNK_OVERLAP)
 
     print(f"[INFO] Created {len(chunks)} chunks from {len(pages)} pages.")
     return chunks
 
 
+def load_site_chunks(path=SITE_KNOWLEDGE_PATH):
+    """
+    Loads the pre-crawled university website text (created by
+    scrape_static.py) and splits it into the same chunk format used
+    for PDFs. Returns an empty list if the file does not exist.
+    """
+    if not os.path.exists(path):
+        print(f"[INFO] No site knowledge file at '{path}'. Skipping website content.")
+        return []
+
+    with open(path, encoding="utf-8") as f:
+        records = json.load(f)
+
+    out = []
+    for rec in records:
+        text = clean_text(rec.get("text", ""))
+        source = rec.get("source", "website")
+        start = 0
+        while start < len(text):
+            piece = text[start:start + CHUNK_SIZE].strip()
+            if len(piece) > 100:
+                out.append({"text": piece, "source": source, "page": "site"})
+            start += (CHUNK_SIZE - CHUNK_OVERLAP)
+
+    print(f"[INFO] Created {len(out)} chunks from {len(records)} website page(s).")
+    return out
+
+
 # ============================================================
-# STEP 4 — EMBEDDING AND FAISS INDEX
+# STEP 4 - EMBEDDING AND INDEX
 # ============================================================
 
 def build_faiss_index(chunks):
     """
-    Converts all chunks into SBERT embeddings and stores
-    them in a FAISS IndexFlatIP index for exact inner
-    product search.
-
-    IndexFlatIP was chosen over approximate methods because:
-    - For a few thousand university document chunks,
-      exact search is fast enough (under 1 second)
-    - Approximate methods are only needed for millions
-      of vectors
+    Embeds all chunks and saves the index. A numpy copy
+    (faiss_index.bin.npy) is ALWAYS saved so the app can run on
+    Streamlit Cloud without installing FAISS.
     """
-    print("[INFO] Loading SBERT embedding model...")
+    print("[INFO] Loading embedding model...")
     model = _load_sbert()
 
     print("[INFO] Generating embeddings for all chunks...")
     texts = [chunk["text"] for chunk in chunks]
-
-    embeddings = model.encode(texts, show_progress_bar=True)
-
-    embeddings = np.array(embeddings, dtype="float32")
+    embeddings = np.array(model.encode(texts, show_progress_bar=True), dtype="float32")
     dimension = embeddings.shape[1]
+
+    # Always save the numpy version (used on the cloud)
+    np.save(FAISS_INDEX_PATH + ".npy", embeddings)
+    print(f"[INFO] Numpy index saved ({len(embeddings)} vectors).")
 
     if FAISS_AVAILABLE:
         index = faiss.IndexFlatIP(dimension)
         index.add(embeddings)
-        print(f"[INFO] FAISS index built with {index.ntotal} vectors.")
         faiss.write_index(index, FAISS_INDEX_PATH)
-        print(f"[INFO] FAISS index saved to '{FAISS_INDEX_PATH}'.")
+        print(f"[INFO] FAISS index saved with {index.ntotal} vectors.")
     else:
-        index = embeddings  # numpy array fallback
-        np.save(FAISS_INDEX_PATH + ".npy", embeddings)
-        print(f"[INFO] Numpy index saved ({len(embeddings)} vectors).")
+        index = embeddings
 
     with open(CHUNKS_PATH, "wb") as f:
         pickle.dump(chunks, f)
@@ -377,96 +330,79 @@ def build_faiss_index(chunks):
 
 
 # ============================================================
-# STEP 5 — LOAD EXISTING INDEX
+# STEP 5 - LOAD EXISTING INDEX (cached)
 # ============================================================
 
+@lru_cache(maxsize=1)
 def load_index_and_chunks():
     """
-    Loads the FAISS index, chunk list, and SBERT model
-    from disk. Called once per question in rag_chain.ask().
+    Loads the index, chunk list and embedder. The result is cached,
+    so it is loaded once per server process instead of on every question.
 
-    If the index files do not exist (e.g. on first run on
-    Streamlit Cloud where they are not committed to GitHub),
-    this function will:
-      1. Try to build the index from any PDFs in the docs/ folder
-      2. If there are no PDFs either, return an empty index so
-         the app can still start and answer via web search
-
-    This makes the app resilient to cold-start deployments
-    where no pre-built index is present.
+    Order of attempts:
+      1. FAISS index on disk (needs faiss)
+      2. Numpy index on disk (works everywhere)
+      3. Build from docs/ and data/site_knowledge.json (needs the
+         embeddings API; slow, so commit the built index instead)
+      4. Empty index (the live web layers can still answer)
     """
-    # ── Case 1: Index files exist — load them ────────────────
     npy_path = FAISS_INDEX_PATH + ".npy"
+
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CHUNKS_PATH) and FAISS_AVAILABLE:
         print("[INFO] Loading FAISS index from disk...")
         index = faiss.read_index(FAISS_INDEX_PATH)
         with open(CHUNKS_PATH, "rb") as f:
             chunks = pickle.load(f)
-        model = _load_sbert()
         print(f"[INFO] Ready. Index contains {index.ntotal} vectors.")
-        return index, chunks, model
+        return index, chunks, _load_sbert()
 
     if os.path.exists(npy_path) and os.path.exists(CHUNKS_PATH):
         print("[INFO] Loading numpy index from disk...")
         index = np.load(npy_path)
         with open(CHUNKS_PATH, "rb") as f:
             chunks = pickle.load(f)
-        model = _load_sbert()
         print(f"[INFO] Ready. Numpy index contains {len(index)} vectors.")
-        return index, chunks, model
+        return index, chunks, _load_sbert()
 
-    # ── Case 2: No index — try building from docs/ folder ────
-    docs_exist = (
-        os.path.exists(DOCS_FOLDER) and
-        any(f.endswith(".pdf") for f in os.listdir(DOCS_FOLDER))
-        if os.path.exists(DOCS_FOLDER) else False
-    )
+    has_docs = (os.path.exists(DOCS_FOLDER) and
+                any(f.lower().endswith(".pdf") for f in os.listdir(DOCS_FOLDER)))
+    has_site = os.path.exists(SITE_KNOWLEDGE_PATH)
 
-    if docs_exist:
-        print("[INFO] No saved index found. Building from docs/ folder...")
-        build_knowledge_base()
-        if FAISS_AVAILABLE and os.path.exists(FAISS_INDEX_PATH):
-            index = faiss.read_index(FAISS_INDEX_PATH)
-        else:
-            index = np.load(npy_path) if os.path.exists(npy_path) else np.zeros((0, 384), dtype="float32")
-        with open(CHUNKS_PATH, "rb") as f:
-            chunks = pickle.load(f)
-        model = _load_sbert()
-        return index, chunks, model
+    if has_docs or has_site:
+        print("[INFO] No saved index found. Building knowledge base...")
+        try:
+            build_knowledge_base()
+        except Exception as e:
+            print(f"[WARNING] Could not build knowledge base: {e}")
+        if os.path.exists(npy_path) and os.path.exists(CHUNKS_PATH):
+            index = np.load(npy_path)
+            with open(CHUNKS_PATH, "rb") as f:
+                chunks = pickle.load(f)
+            return index, chunks, _load_sbert()
 
-    # ── Case 3: No index AND no docs — return empty index ────
-    print("[WARNING] No index and no PDF documents found.")
-    print("[INFO] Starting with empty index — web search still works.")
-    model = _load_sbert()
-    # Empty numpy array — semantic_retrieve will detect len==0 and skip
-    index = np.zeros((0, 384), dtype="float32")
-    chunks = []
-    return index, chunks, model
+    print("[WARNING] No index available. Starting with an empty index.")
+    return np.zeros((0, EMBEDDING_DIM), dtype="float32"), [], _load_sbert()
 
 
 # ============================================================
-# STEP 6 — SEMANTIC RETRIEVAL (LAYER 1)
+# STEP 6 - SEMANTIC RETRIEVAL (LAYER 1)
 # ============================================================
 
 def semantic_retrieve(query, index, chunks, model, top_k=TOP_K):
     """
-    Encodes the query using SBERT and searches the FAISS
-    index for the most semantically similar document chunks.
-
-    Returns chunks ranked by cosine similarity score.
-    Returns an empty list if the index is empty (no documents uploaded yet).
+    Embeds the query and returns the most similar chunks.
+    Returns an empty list if the index is empty.
     """
-    # Guard: if the index is empty, skip search
     n_vecs = index.ntotal if FAISS_AVAILABLE and hasattr(index, "ntotal") else len(index)
     if n_vecs == 0:
-        print("[INFO] Index is empty — no local documents to search.")
+        print("[INFO] Index is empty - no stored documents to search.")
         return []
 
     query_embedding = model.encode([query]).astype("float32")
 
+    results = []
     if FAISS_AVAILABLE and hasattr(index, "search"):
         scores, indices = index.search(query_embedding, top_k)
-        results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1:
                 continue
@@ -478,11 +414,8 @@ def semantic_retrieve(query, index, chunks, model, top_k=TOP_K):
                 "retrieval_type": "semantic"
             })
     else:
-        # Numpy dot-product fallback
         dot_scores = (index @ query_embedding.T).flatten()
-        top_indices = np.argsort(dot_scores)[::-1][:top_k]
-        results = []
-        for idx in top_indices:
+        for idx in np.argsort(dot_scores)[::-1][:top_k]:
             results.append({
                 "text": chunks[idx]["text"],
                 "source": chunks[idx]["source"],
@@ -495,19 +428,15 @@ def semantic_retrieve(query, index, chunks, model, top_k=TOP_K):
 
 
 # ============================================================
-# STEP 7 — BM25 BASELINE RETRIEVAL
+# STEP 7 - BM25 RETRIEVAL (baseline and fallback)
 # ============================================================
 
 def build_bm25_index(chunks):
-    """
-    Builds a BM25 keyword index from the same chunks used
-    for FAISS. Used only for baseline evaluation comparison.
-    """
+    """Builds a BM25 keyword index from the same chunks."""
     tokenised = []
     for chunk in chunks:
         tokens = word_tokenize(chunk["text"].lower())
-        tokens = [t for t in tokens if t.isalpha()
-                  and t not in STOP_WORDS]
+        tokens = [t for t in tokens if t.isalpha() and t not in STOP_WORDS]
         tokenised.append(tokens)
 
     bm25 = BM25Okapi(tokenised)
@@ -515,13 +444,9 @@ def build_bm25_index(chunks):
 
 
 def bm25_retrieve(query, bm25, chunks, top_k=TOP_K):
-    """
-    Retrieves top_k chunks using BM25 keyword matching.
-    Used for baseline evaluation only.
-    """
+    """Retrieves top_k chunks using BM25 keyword matching."""
     tokens = word_tokenize(query.lower())
-    tokens = [t for t in tokens if t.isalpha()
-              and t not in STOP_WORDS]
+    tokens = [t for t in tokens if t.isalpha() and t not in STOP_WORDS]
 
     scores = bm25.get_scores(tokens)
     top_indices = np.argsort(scores)[::-1][:top_k]
@@ -540,15 +465,14 @@ def bm25_retrieve(query, bm25, chunks, top_k=TOP_K):
 
 
 # ============================================================
-# STEP 8 — LAYER 3: UNIVERSITY WEBSITE AND GENERAL WEB SEARCH
+# STEP 8 - LAYER 3: UNIVERSITY WEBSITE AND GENERAL WEB SEARCH
 # ============================================================
 
 def scrape_university_websites(query):
     """
-    Directly visits the official university website and Facebook page,
-    reads the full content, and returns passages relevant to the query.
-    This gives more accurate and complete information than DuckDuckGo
-    snippets which only show brief extracts.
+    Fetches the pages listed in UNIVERSITY_URLS and returns passages
+    that match the query. Fails safely: any error just means no
+    live passages from that page.
     """
     results = []
     headers = {
@@ -564,26 +488,22 @@ def scrape_university_websites(query):
             print(f"[INFO] Scraping: {url}")
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code != 200:
-                print(f"[WARNING] Could not access {url} — status {resp.status_code}")
+                print(f"[WARNING] Could not access {url} - status {resp.status_code}")
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Remove script and style tags
             for tag in soup(["script", "style", "nav", "footer", "header"]):
                 tag.decompose()
 
-            # Extract all visible text
             text = soup.get_text(separator=" ", strip=True)
             text = re.sub(r'\s+', ' ', text).strip()
 
             if not text or len(text) < 100:
                 continue
 
-            # Split into chunks of ~500 characters
             chunk_size = 500
             for i in range(0, min(len(text), 5000), chunk_size):
-                chunk = text[i:i+chunk_size].strip()
+                chunk = text[i:i + chunk_size].strip()
                 if len(chunk) > 100:
                     query_words = query.lower().split()
                     chunk_lower = chunk.lower()
@@ -608,30 +528,22 @@ def scrape_university_websites(query):
 
 
 def _ddg_search_one(sq, top_k, region="ng-en"):
-    """
-    Helper — runs a single DuckDuckGo text search.
-    Designed to be called from a thread pool.
-    Returns a list of raw result dicts, or [] on error.
-    """
+    """Runs a single web search. Returns [] on any error."""
     try:
-        ddgs_inst = DDGS()
-        return list(ddgs_inst.text(sq, max_results=top_k, region=region))
-    except Exception:
+        return list(DDGS().text(sq, max_results=top_k, region=region))
+    except Exception as e:
+        print(f"[WARNING] Web search failed for '{sq}': {e}")
         return []
 
 
 def web_search_university(query, top_k=WEB_TOP_K):
-    """
-    LAYER 3 — Searches the university website and general
-    web for current institutional information including
-    announcements, timetables, news, and admin updates.
-    """
+    """LAYER 3 - live web search about the university."""
     results = []
 
     try:
         search_queries = [
             f"{UNIVERSITY_NAME} {query}",
-            f"FMOAU Makurdi {query}",
+            f"MOAUM Makurdi {query}",
             f"Benue State University Makurdi {query}",
         ]
 
@@ -646,21 +558,19 @@ def web_search_university(query, top_k=WEB_TOP_K):
                 sq = futures[future]
                 print(f"[INFO] Layer 3 search completed: '{sq}'")
                 try:
-                    r = future.result()
-                    search_results.extend(r)
+                    search_results.extend(future.result())
                 except Exception:
                     pass
 
         if not search_results:
             print("[INFO] No university results. Trying plain search...")
-            ddgs_inst = DDGS()
-            search_results = list(ddgs_inst.text(query, max_results=top_k))
+            search_results = _ddg_search_one(query, top_k, region="wt-wt")
 
         seen_urls = set()
         for result in search_results:
             snippet = result.get("body", "")
-            url     = result.get("href", "")
-            title   = result.get("title", "")
+            url = result.get("href", "")
+            title = result.get("title", "")
             if url in seen_urls:
                 continue
             seen_urls.add(url)
@@ -681,28 +591,18 @@ def web_search_university(query, top_k=WEB_TOP_K):
 
 
 # ============================================================
-# STEP 9 — LAYER 2: ACADEMIC WEB SEARCH
+# STEP 9 - LAYER 2: ACADEMIC WEB SEARCH
 # ============================================================
 
 def web_search_academic(query, top_k=WEB_TOP_K):
-    """
-    LAYER 2 — Searches trusted academic sources online
-    when a student asks about course content, definitions,
-    concepts, or topics not covered in uploaded PDFs.
-    """
+    """LAYER 2 - live search of trusted academic sources."""
     results = []
 
     try:
         academic_query = f"{query} explanation definition university course"
         print(f"[INFO] Layer 2 academic search: '{academic_query}'")
 
-        ddgs_inst = DDGS()
-        search_results = list(
-            ddgs_inst.text(
-                academic_query,
-                max_results=top_k * 2,
-            )
-        )
+        search_results = _ddg_search_one(academic_query, top_k * 2, region="wt-wt")
 
         trusted_results = []
         other_results = []
@@ -715,23 +615,20 @@ def web_search_academic(query, top_k=WEB_TOP_K):
             if len(snippet.strip()) < 50:
                 continue
 
-            is_trusted = any(source in url for source in ACADEMIC_SOURCES)
-
             entry = {
                 "text": f"{title}. {snippet}",
                 "source": url,
                 "page": "web",
                 "score": None,
-                "retrieval_type": "web — academic"
+                "retrieval_type": "web \u2014 academic"
             }
 
-            if is_trusted:
+            if any(source in url for source in ACADEMIC_SOURCES):
                 trusted_results.append(entry)
             else:
                 other_results.append(entry)
 
-        combined = trusted_results + other_results
-        results = combined[:top_k]
+        results = (trusted_results + other_results)[:top_k]
 
     except Exception as e:
         print(f"[WARNING] Academic web search failed: {e}")
@@ -741,24 +638,34 @@ def web_search_academic(query, top_k=WEB_TOP_K):
 
 
 # ============================================================
-# STEP 10 — COMBINED THREE-LAYER RETRIEVAL PIPELINE
+# STEP 10 - COMBINED RETRIEVAL PIPELINE
 # ============================================================
 
 def retrieve(query, index, chunks, model, use_web=True):
     """
-    The main retrieval function — combines all three layers:
-
-    LAYER 1: Semantic retrieval from local PDF knowledge base
-    LAYER 2: Academic web search for course content
-    LAYER 3: University website and general web search
+    Combines all layers. If semantic retrieval fails (for example
+    the embeddings API is unreachable), it falls back to BM25
+    keyword retrieval over the same stored chunks.
     """
-    print(f"\n[INFO] Starting three-layer retrieval for: '{query}'")
+    print(f"\n[INFO] Starting retrieval for: '{query}'")
 
-    print("[INFO] Layer 1: Searching local knowledge base...")
-    local_results = semantic_retrieve(query, index, chunks, model)
+    print("[INFO] Layer 1: Searching stored knowledge base...")
+    try:
+        local_results = semantic_retrieve(query, index, chunks, model)
+    except Exception as e:
+        print(f"[WARNING] Semantic retrieval failed ({e}). Using BM25 fallback.")
+        local_results = []
+        if chunks:
+            try:
+                bm25, _ = build_bm25_index(chunks)
+                local_results = bm25_retrieve(query, bm25, chunks)
+            except Exception as e2:
+                print(f"[WARNING] BM25 fallback failed: {e2}")
+        for r in local_results:
+            r["score"] = 0.0     # forces the web layers to run as well
 
     top_score = local_results[0]["score"] if local_results else 0.0
-    print(f"[INFO] Layer 1 top similarity score: {top_score:.4f}")
+    print(f"[INFO] Layer 1 top score: {top_score:.4f}")
 
     layer2_results = []
     layer3_results = []
@@ -785,17 +692,17 @@ def retrieve(query, index, chunks, model, use_web=True):
         run_layer2 = top_score < CONFIDENCE_THRESHOLD or is_academic_query or is_staff_query
 
         scraped_results = []
-        search_results  = []
+        search_results = []
 
         with ThreadPoolExecutor(max_workers=3) as executor:
-            future_scrape  = executor.submit(scrape_university_websites, query)
-            future_layer3  = executor.submit(web_search_university, query, WEB_TOP_K)
-            future_layer2  = (
+            future_scrape = executor.submit(scrape_university_websites, query)
+            future_layer3 = executor.submit(web_search_university, query, WEB_TOP_K)
+            future_layer2 = (
                 executor.submit(web_search_academic, query, WEB_TOP_K)
                 if run_layer2 else None
             )
 
-            print("[INFO] Layer 3: Scraping + searching university web sources (parallel)...")
+            print("[INFO] Layer 3: live university web sources (parallel)...")
             try:
                 scraped_results = future_scrape.result(timeout=12)
             except Exception as e:
@@ -807,7 +714,7 @@ def retrieve(query, index, chunks, model, use_web=True):
                 print(f"[WARNING] Layer 3 search failed: {e}")
 
             if future_layer2:
-                print("[INFO] Layer 2: Searching academic web sources (parallel)...")
+                print("[INFO] Layer 2: academic web sources (parallel)...")
                 try:
                     layer2_results = future_layer2.result(timeout=12)
                 except Exception as e:
@@ -818,7 +725,7 @@ def retrieve(query, index, chunks, model, use_web=True):
     combined = local_results + layer3_results + layer2_results
 
     print(f"[INFO] Total passages retrieved: {len(combined)}")
-    print(f"  - Local (Layer 1): {len(local_results)}")
+    print(f"  - Stored (Layer 1): {len(local_results)}")
     print(f"  - University web (Layer 3): {len(layer3_results)}")
     print(f"  - Academic web (Layer 2): {len(layer2_results)}")
 
@@ -826,29 +733,29 @@ def retrieve(query, index, chunks, model, use_web=True):
 
 
 # ============================================================
-# STEP 11 — KNOWLEDGE BASE BUILDER
+# STEP 11 - KNOWLEDGE BASE BUILDER (run locally)
 # ============================================================
 
 def build_knowledge_base():
     """
-    Runs the full offline preprocessing pipeline:
-        1. Load all PDFs from docs/ folder
-        2. Clean and chunk the text
-        3. Build and save the FAISS index
+    Offline pipeline:
+        1. Load PDFs from docs/
+        2. Load the crawled website text (data/site_knowledge.json)
+        3. Chunk, embed and save chunks.pkl + faiss_index.bin.npy
 
-    Run this once, or whenever new documents are added.
+    Run this on your own computer, then commit the output files.
     """
     print("=" * 60)
     print("Building Knowledge Base")
     print("=" * 60)
 
     pages = load_pdfs_from_folder(DOCS_FOLDER)
+    chunks = chunk_pages(pages) + load_site_chunks()
 
-    if not pages:
-        print("[ERROR] No pages loaded. Add PDFs to the docs/ folder.")
+    if not chunks:
+        print("[ERROR] Nothing to index. Add PDFs to docs/ or run scrape_static.py.")
         return
 
-    chunks = chunk_pages(pages)
     build_faiss_index(chunks)
 
     print("=" * 60)
@@ -856,10 +763,6 @@ def build_knowledge_base():
     print(f"Total chunks indexed: {len(chunks)}")
     print("=" * 60)
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     build_knowledge_base()

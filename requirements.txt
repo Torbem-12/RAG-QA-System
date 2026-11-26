@@ -4,7 +4,7 @@ pyarrow==18.1.0
 numpy==1.26.4
 nltk
 rank-bm25
-duckduckgo-search
+ddgs
 requests
 beautifulsoup4
 groq

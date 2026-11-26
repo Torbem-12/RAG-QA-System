@@ -4,3 +4,5 @@ __pycache__/
 ngrok.exe
 faiss_index.bin
 *.pyc
+data/users.json
+data/histories/

@@ -836,17 +836,16 @@ def show_main_app():
                     f'<div class="bot-bubble">{body}</div>'
                     f'</div>', unsafe_allow_html=True)
                 sources = msg.get("sources", [])
+                def _is_web(s):
+                    return (s.get("retrieval_type") in ("uni_web", "academic",
+                            "web — university/general", "web — academic")
+                            or str(s.get("source", "")).startswith("http"))
+
                 if sources:
                     # Determine primary source type from top result
                     pdf_sources = [s for s in sources
-                                   if s.get("retrieval_type") in
-                                   ("semantic", "bm25", "local")]
-                    web_sources = [s for s in sources
-                                   if s.get("retrieval_type") in
-                                   ("uni_web", "academic",
-                                    "web — university/general",
-                                    "web — academic")]
-
+                                   if not _is_web(s) and s.get("retrieval_type") in ("semantic", "bm25", "local")]
+                    web_sources = [s for s in sources if _is_web(s)]
                     # Show only the source the answer came from
                     if pdf_sources and web_sources:
                         # Both used — show top PDF pages and top web source
