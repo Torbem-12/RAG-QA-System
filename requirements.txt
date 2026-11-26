@@ -10,3 +10,4 @@ beautifulsoup4
 groq
 python-dotenv
 tqdm
+sentence-transformers
